@@ -92,6 +92,7 @@ fn missing_readiness_is_returned_after_worker_cleanup() {
 
 #[test]
 fn explicit_shutdown_then_drop_sends_once_and_joins() {
+    let (requested, requests_returned) = mpsc::channel();
     let cleaned = Arc::new(AtomicBool::new(false));
     let worker_cleaned = Arc::clone(&cleaned);
     let mut worker = Worker::spawn::<TestError>("sweetidle-test", move |ready, shutdown| {
@@ -99,6 +100,10 @@ fn explicit_shutdown_then_drop_sends_once_and_joins() {
         shutdown
             .recv_blocking()
             .unwrap_or_else(|error| panic!("{error}"));
+        // receiving the message can precede the sender's drop inside request_shutdown
+        requests_returned
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|error| panic!("shutdown requests did not return: {error}"));
         assert!(matches!(
             shutdown.try_recv(),
             Err(async_channel::TryRecvError::Closed)
@@ -108,6 +113,7 @@ fn explicit_shutdown_then_drop_sends_once_and_joins() {
     .unwrap_or_else(|error| panic!("{error:?}"));
     worker.request_shutdown();
     worker.request_shutdown();
+    requested.send(()).unwrap_or_else(|error| panic!("{error}"));
     drop(worker);
     assert!(cleaned.load(Ordering::SeqCst));
 }
