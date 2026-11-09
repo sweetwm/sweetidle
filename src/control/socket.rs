@@ -16,7 +16,10 @@ use std::{
 use calloop::channel::{Channel, Sender as EventSender, channel};
 use rustix::event::{PollFd, PollFlags, poll};
 
-use super::{ControlError, ControlEvent, ControlRequest, StatusFormat};
+use super::{
+    ControlError, ControlEvent, ControlRequest, SleepCycleId, SleepEvent, StatusFormat,
+    sleep::SLEEP_WAIT_TIMEOUT,
+};
 
 const SOCKET_NAME: &str = "sweetidle.sock";
 const STATUS_COMMAND: &[u8] = b"status\n";
@@ -28,6 +31,12 @@ const IO_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_REQUEST_BYTES: u64 = 64;
 const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 
+#[derive(Clone, Copy)]
+pub(super) enum SocketKind {
+    Control,
+    Sleep,
+}
+
 pub(crate) struct ControlMonitor {
     shutdown: Option<UnixStream>,
     thread: Option<JoinHandle<()>>,
@@ -38,15 +47,35 @@ impl ControlMonitor {
         Self::connect_at(control_socket_path()?)
     }
 
+    pub(crate) fn connect_sleep() -> Result<(Self, Channel<ControlEvent>), ControlError> {
+        Self::connect_for(
+            control_socket_path()?.with_file_name("sweetidle-sleep.sock"),
+            SocketKind::Sleep,
+        )
+    }
+
     fn connect_at(socket_path: PathBuf) -> Result<(Self, Channel<ControlEvent>), ControlError> {
+        Self::connect_for(socket_path, SocketKind::Control)
+    }
+
+    pub(super) fn connect_for(
+        socket_path: PathBuf,
+        kind: SocketKind,
+    ) -> Result<(Self, Channel<ControlEvent>), ControlError> {
         let listener = bind_socket(&socket_path)?;
         let socket_file = SocketFile::new(socket_path.clone())?;
         let (shutdown, worker_shutdown) =
             UnixStream::pair().map_err(|source| ControlError::CreateShutdownChannel { source })?;
         let (event_sender, event_channel) = channel();
         let thread = thread::Builder::new()
-            .name("sweetidle-control".to_string())
-            .spawn(move || run_worker(listener, socket_file, event_sender, worker_shutdown))
+            .name(
+                match kind {
+                    SocketKind::Control => "sweetidle-control",
+                    SocketKind::Sleep => "sweetidle-sleep",
+                }
+                .to_string(),
+            )
+            .spawn(move || run_worker(listener, socket_file, event_sender, worker_shutdown, kind))
             .map_err(|source| ControlError::SpawnWorker {
                 path: socket_path.clone(),
                 source,
@@ -93,16 +122,36 @@ pub fn reload() -> Result<String, ControlError> {
     send_command_at(&control_socket_path()?, RELOAD_COMMAND)
 }
 
+pub(super) fn send_sleep_event(
+    event: SleepEvent,
+    cycle: &SleepCycleId,
+    timeout: Duration,
+) -> Result<String, ControlError> {
+    send_command_with_timeout(
+        &control_socket_path()?.with_file_name("sweetidle-sleep.sock"),
+        event.command(cycle).as_bytes(),
+        timeout,
+    )
+}
+
 fn send_command_at(socket_path: &Path, command: &[u8]) -> Result<String, ControlError> {
+    send_command_with_timeout(socket_path, command, IO_TIMEOUT)
+}
+
+pub(super) fn send_command_with_timeout(
+    socket_path: &Path,
+    command: &[u8],
+    timeout: Duration,
+) -> Result<String, ControlError> {
     let mut stream = UnixStream::connect(socket_path).map_err(|source| ControlError::Connect {
         path: socket_path.to_path_buf(),
         source,
     })?;
     stream
-        .set_read_timeout(Some(IO_TIMEOUT))
+        .set_read_timeout(Some(timeout))
         .map_err(|source| ControlError::ConfigureClient { source })?;
     stream
-        .set_write_timeout(Some(IO_TIMEOUT))
+        .set_write_timeout(Some(timeout))
         .map_err(|source| ControlError::ConfigureClient { source })?;
     stream
         .write_all(command)
@@ -219,6 +268,7 @@ fn run_worker(
     _socket_file: SocketFile,
     events: EventSender<ControlEvent>,
     shutdown: UnixStream,
+    kind: SocketKind,
 ) {
     // poll shutdown and clients together so monitor drop can stop this thread
     loop {
@@ -252,14 +302,18 @@ fn run_worker(
                 return;
             }
         };
-        if !serve_client(stream, &events) {
+        if !serve_client(stream, &events, kind) {
             return;
         }
     }
 }
 
-fn serve_client(mut stream: UnixStream, events: &EventSender<ControlEvent>) -> bool {
-    let result = handle_client(&mut stream, events);
+fn serve_client(
+    mut stream: UnixStream,
+    events: &EventSender<ControlEvent>,
+    kind: SocketKind,
+) -> bool {
+    let result = handle_client(&mut stream, events, kind);
     match result {
         Ok(()) => true,
         Err(ClientRequestError::RuntimeStopped) => false,
@@ -273,6 +327,7 @@ fn serve_client(mut stream: UnixStream, events: &EventSender<ControlEvent>) -> b
 fn handle_client(
     stream: &mut UnixStream,
     events: &EventSender<ControlEvent>,
+    kind: SocketKind,
 ) -> Result<(), ClientRequestError> {
     // bound each exchange so a client cannot hold the worker indefinitely
     stream
@@ -290,7 +345,11 @@ fn handle_client(
     if request.len() as u64 > MAX_REQUEST_BYTES {
         return Err(ClientRequestError::TooLarge);
     }
-    let command = request_command(&request)?;
+    let command = request_command(&request, kind)?;
+    let before_cycle = match &command {
+        ControlCommand::Sleep(SleepEvent::Before, cycle) => Some(cycle.clone()),
+        _ => None,
+    };
     let (reply_sender, reply_receiver) = mpsc::sync_channel(1);
     let control_request = ControlRequest::new(reply_sender);
     let event = match command {
@@ -301,30 +360,78 @@ fn handle_client(
         ControlCommand::Pause => ControlEvent::Pause(control_request),
         ControlCommand::Resume => ControlEvent::Resume(control_request),
         ControlCommand::Reload => ControlEvent::Reload(control_request),
+        ControlCommand::Sleep(event, cycle) => ControlEvent::Sleep {
+            cycle,
+            event,
+            request: Some(control_request),
+        },
     };
     events
         .send(event)
         .map_err(|_| ClientRequestError::RuntimeStopped)?;
-    let response = reply_receiver
-        .recv_timeout(IO_TIMEOUT)
-        .map_err(|error| match error {
-            mpsc::RecvTimeoutError::Timeout => ClientRequestError::RuntimeTimeout,
-            mpsc::RecvTimeoutError::Disconnected => ClientRequestError::RuntimeStopped,
-        })?;
-    stream
-        .write_all(response.as_bytes())
-        .map_err(ClientRequestError::Io)
+    let timeout = if before_cycle.is_some() {
+        SLEEP_WAIT_TIMEOUT
+    } else {
+        IO_TIMEOUT
+    };
+    let result = reply_receiver.recv_timeout(timeout);
+    if before_cycle.is_some()
+        && !result
+            .as_ref()
+            .is_ok_and(|response| !response.starts_with("error: "))
+    {
+        // a failed or abandoned preparation must not leave the daemon in a sleep cycle
+        let _ = events.send(ControlEvent::Sleep {
+            event: SleepEvent::Cancel,
+            cycle: before_cycle
+                .as_ref()
+                .ok_or(ClientRequestError::UnknownCommand)?
+                .clone(),
+            request: None,
+        });
+    }
+    let response = result.map_err(|error| match error {
+        mpsc::RecvTimeoutError::Timeout => ClientRequestError::RuntimeTimeout,
+        mpsc::RecvTimeoutError::Disconnected => ClientRequestError::RuntimeStopped,
+    })?;
+    let write = stream.write_all(response.as_bytes());
+    if write.is_err()
+        && let Some(cycle) = before_cycle
+    {
+        let _ = events.send(ControlEvent::Sleep {
+            event: SleepEvent::Cancel,
+            cycle,
+            request: None,
+        });
+    }
+    write.map_err(ClientRequestError::Io)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ControlCommand {
     Status(StatusFormat),
     Pause,
     Resume,
     Reload,
+    Sleep(SleepEvent, SleepCycleId),
 }
 
-fn request_command(request: &[u8]) -> Result<ControlCommand, ClientRequestError> {
+fn request_command(request: &[u8], kind: SocketKind) -> Result<ControlCommand, ClientRequestError> {
+    if matches!(kind, SocketKind::Sleep) {
+        let text = std::str::from_utf8(request).map_err(|_| ClientRequestError::UnknownCommand)?;
+        let (name, cycle) = text
+            .strip_suffix('\n')
+            .and_then(|text| text.split_once(' '))
+            .ok_or(ClientRequestError::UnknownCommand)?;
+        let cycle =
+            SleepCycleId::try_from(cycle).map_err(|_| ClientRequestError::UnknownCommand)?;
+        return match name {
+            "before-sleep" => Ok(ControlCommand::Sleep(SleepEvent::Before, cycle)),
+            "after-resume" => Ok(ControlCommand::Sleep(SleepEvent::After, cycle)),
+            "cancel-sleep" => Ok(ControlCommand::Sleep(SleepEvent::Cancel, cycle)),
+            _ => Err(ClientRequestError::UnknownCommand),
+        };
+    }
     match request {
         STATUS_COMMAND => Ok(ControlCommand::Status(StatusFormat::Text)),
         STATUS_JSON_COMMAND => Ok(ControlCommand::Status(StatusFormat::Json)),
@@ -680,6 +787,7 @@ mod tests {
                 panic!("unexpected control command")
             }
             ControlEvent::Failed(error) => panic!("control worker failed: {error}"),
+            ControlEvent::Sleep { .. } => panic!("unexpected sleep event"),
         }
 
         let response = client
@@ -718,6 +826,7 @@ mod tests {
                 panic!("unexpected control command")
             }
             ControlEvent::Failed(error) => panic!("control worker failed: {error}"),
+            ControlEvent::Sleep { .. } => panic!("unexpected sleep event"),
         }
 
         let response = client
@@ -763,6 +872,7 @@ mod tests {
                 panic!("unexpected control command")
             }
             ControlEvent::Failed(error) => panic!("control worker failed: {error}"),
+            ControlEvent::Sleep { .. } => panic!("unexpected sleep event"),
         }
         let follow_up = client
             .join()
@@ -790,6 +900,7 @@ mod tests {
                 panic!("unexpected control command")
             }
             ControlEvent::Failed(error) => panic!("control worker failed: {error}"),
+            ControlEvent::Sleep { .. } => panic!("unexpected sleep event"),
         }
 
         let response = client

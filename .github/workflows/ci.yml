@@ -106,6 +106,7 @@ jobs:
         run: |
           set -eu
           sudo pkg install -y rust dbus
+          sh -n freebsd/sweetidle_sleep
           cargo fmt --check
           cargo clippy --locked --all-targets -- -D warnings
           cargo test --locked

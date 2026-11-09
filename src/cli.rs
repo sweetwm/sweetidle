@@ -10,6 +10,10 @@ pub(super) enum Action {
     Pause,
     Resume,
     Reload,
+    Sleep(
+        sweetidle::control::SleepEvent,
+        sweetidle::control::SleepCycleId,
+    ),
     CheckConfig(Option<PathBuf>),
     Run {
         path: Option<PathBuf>,
@@ -45,6 +49,21 @@ pub(super) fn parse_args(
             Some("pause") => set_control_action(&mut control_action, Action::Pause)?,
             Some("resume") => set_control_action(&mut control_action, Action::Resume)?,
             Some("reload") => set_control_action(&mut control_action, Action::Reload)?,
+            Some(name @ ("before-sleep" | "after-resume" | "cancel-sleep")) => {
+                use sweetidle::control::{SleepCycleId, SleepEvent};
+                let value = args
+                    .next()
+                    .ok_or_else(|| format!("`{name}` requires a sleep cycle ID"))?;
+                let cycle =
+                    SleepCycleId::try_from(value.to_str().ok_or("sleep cycle ID must be ASCII")?)
+                        .map_err(|error| error.to_string())?;
+                let event = match name {
+                    "before-sleep" => SleepEvent::Before,
+                    "after-resume" => SleepEvent::After,
+                    _ => SleepEvent::Cancel,
+                };
+                set_control_action(&mut control_action, Action::Sleep(event, cycle))?;
+            }
             Some("--json") => status_json = true,
             Some("--check-config") => check_config = true,
             Some(flag @ ("-c" | "--config")) => {
@@ -113,6 +132,9 @@ Commands:
   pause               Pause idle listeners and the idle hint
   resume              Resume idle detection with fresh timers
   reload              Queue a reload of the active config
+  before-sleep ID     Prepare for FreeBSD suspend (system hook)
+  after-resume ID     Finish a FreeBSD sleep cycle (system hook)
+  cancel-sleep ID     Cancel FreeBSD sleep preparation (system hook)
 
 Options:
       --json           Print status as JSON (status only)
@@ -130,6 +152,22 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{Action, StatusOutput, parse_args};
+
+    #[test]
+    fn sleep_events_require_a_bounded_cycle_id_and_reject_config_options() {
+        for command in ["before-sleep", "after-resume", "cancel-sleep"] {
+            assert!(matches!(
+                parse_args([command, "cycle-1"]),
+                Ok(Action::Sleep(_, _))
+            ));
+            assert!(parse_args([command]).is_err());
+            for invalid in ["", "bad cycle", "cycle\n", "../../socket"] {
+                assert!(parse_args([command, invalid]).is_err());
+            }
+            assert!(parse_args([command, "cycle-1", "--config", "ignored.toml"]).is_err());
+            assert!(parse_args([command, "cycle-1", "--json"]).is_err());
+        }
+    }
 
     #[test]
     fn no_arguments_runs_with_the_default_config() {

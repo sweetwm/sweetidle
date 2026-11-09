@@ -179,14 +179,6 @@ fn rejects_unsupported_hooks_before_connecting_to_a_desktop() -> Result<(), Box<
             "[general]\nunlock_command = 'exit 0'\n",
             "general.unlock_command",
         ),
-        (
-            "[general]\nbefore_sleep_command = 'exit 0'\n",
-            "general.before_sleep_command",
-        ),
-        (
-            "[general]\nafter_resume_command = 'exit 0'\n",
-            "general.after_resume_command",
-        ),
         ("[idle_hint]\ntimeout = 30\n", "idle_hint"),
     ] {
         fs::write(&path, source)?;

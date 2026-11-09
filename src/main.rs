@@ -35,6 +35,7 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
         Action::Pause => print_control(control::pause())?,
         Action::Resume => print_control(control::resume())?,
         Action::Reload => print_control(control::reload())?,
+        Action::Sleep(event, cycle) => print_control(control::notify_sleep(event, &cycle))?,
         Action::CheckConfig(path) => check_config_file(path)?,
         Action::Run { path, verbose } => run_daemon(path, verbose)?,
     }
@@ -76,7 +77,9 @@ fn run_daemon(path: Option<PathBuf>, verbose: bool) -> Result<(), String> {
         "sweetidle started"
     );
     #[cfg(target_os = "freebsd")]
-    info!("FreeBSD basic support: system session hooks and systemd inhibitors are unavailable");
+    info!(
+        "FreeBSD sleep hooks use the sweetidle_sleep rc integration; logind session hooks and systemd inhibitors are unavailable"
+    );
     for event in runtime.take_startup_events() {
         handle_runtime_event(event);
     }
