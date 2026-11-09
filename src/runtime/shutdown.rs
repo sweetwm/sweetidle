@@ -4,8 +4,10 @@ use std::{
         fd::{AsFd, BorrowedFd},
         unix::net::UnixStream,
     },
-    sync::{Arc, atomic::AtomicBool},
 };
+
+#[cfg(target_os = "linux")]
+use std::sync::{Arc, atomic::AtomicBool};
 
 use calloop::{Interest, LoopHandle, Mode, PostAction, generic::Generic};
 use signal_hook::{
@@ -37,7 +39,10 @@ pub(super) fn register_sources(
     register_source(handle, RuntimeSignal::Interrupt)?;
     register_source(handle, RuntimeSignal::Terminate)?;
     register_source(handle, RuntimeSignal::Reload)?;
+    #[cfg(target_os = "freebsd")]
+    register_child_source(handle)?;
     // an ignored SIGCHLD makes the kernel reap hooks, and any handler undoes that
+    #[cfg(target_os = "linux")]
     signal_hook::flag::register(SIGCHLD, Arc::new(AtomicBool::new(false))).map_err(|source| {
         RuntimeError::RegisterSignalHandler {
             signal: "SIGCHLD",
@@ -46,6 +51,13 @@ pub(super) fn register_sources(
     })?;
 
     Ok(())
+}
+
+#[cfg(target_os = "freebsd")]
+pub(super) fn register_child_source(
+    handle: &LoopHandle<'static, RuntimeState>,
+) -> Result<(), RuntimeError> {
+    register_source(handle, RuntimeSignal::ChildExited)
 }
 
 fn register_source(
@@ -67,6 +79,8 @@ fn register_source(
                     RuntimeSignal::Terminate => {
                         state.request_shutdown(ShutdownSignal::Terminate);
                     }
+                    #[cfg(target_os = "freebsd")]
+                    RuntimeSignal::ChildExited => state.commands.mark_children_changed(),
                     RuntimeSignal::Reload => {
                         state.request_reload();
                     }
@@ -84,6 +98,8 @@ fn register_source(
 
 #[derive(Debug, Clone, Copy)]
 enum RuntimeSignal {
+    #[cfg(target_os = "freebsd")]
+    ChildExited,
     Interrupt,
     Terminate,
     Reload,
@@ -95,6 +111,8 @@ impl RuntimeSignal {
             Self::Interrupt => ShutdownSignal::Interrupt.name(),
             Self::Terminate => ShutdownSignal::Terminate.name(),
             Self::Reload => "SIGHUP",
+            #[cfg(target_os = "freebsd")]
+            Self::ChildExited => "SIGCHLD",
         }
     }
 
@@ -103,6 +121,8 @@ impl RuntimeSignal {
             Self::Interrupt => SIGINT,
             Self::Terminate => SIGTERM,
             Self::Reload => SIGHUP,
+            #[cfg(target_os = "freebsd")]
+            Self::ChildExited => SIGCHLD,
         }
     }
 }
@@ -215,7 +235,7 @@ mod tests {
         };
         let config = Config::default();
         let listeners = ListenerSet::from_config(&config);
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config/example.toml");
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config/freebsd.toml");
         let (_monitor, requester, _events) = match ConfigReloadMonitor::connect(path) {
             Ok(parts) => parts,
             Err(error) => panic!("failed to start reload monitor: {error}"),

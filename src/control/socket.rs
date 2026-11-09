@@ -109,6 +109,14 @@ fn send_command_at(socket_path: &Path, command: &[u8]) -> Result<String, Control
         .map_err(|source| ControlError::WriteRequest { source })?;
     stream
         .shutdown(std::net::Shutdown::Write)
+        // a fast reply and close can precede this half-close on FreeBSD
+        .or_else(|source| {
+            if source.kind() == io::ErrorKind::NotConnected {
+                Ok(())
+            } else {
+                Err(source)
+            }
+        })
         .map_err(|source| ControlError::WriteRequest { source })?;
 
     let mut response = Vec::new();
@@ -163,6 +171,8 @@ fn bind_socket(path: &Path) -> Result<UnixListener, ControlError> {
 }
 
 fn replace_stale_socket(path: &Path) -> Result<(), ControlError> {
+    // connecting to an ordinary file on FreeBSD fails before proving connection refusal
+    check_socket_file(path)?;
     // only a refused connection proves an existing socket has no listener
     match UnixStream::connect(path) {
         Ok(_) => return Err(ControlError::AlreadyRunning(path.to_path_buf())),
@@ -175,6 +185,14 @@ fn replace_stale_socket(path: &Path) -> Result<(), ControlError> {
         }
     }
 
+    check_socket_file(path)?;
+    fs::remove_file(path).map_err(|source| ControlError::RemoveStaleSocket {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn check_socket_file(path: &Path) -> Result<(), ControlError> {
     let metadata = fs::symlink_metadata(path).map_err(|source| ControlError::InspectSocket {
         path: path.to_path_buf(),
         source,
@@ -182,10 +200,7 @@ fn replace_stale_socket(path: &Path) -> Result<(), ControlError> {
     if !metadata.file_type().is_socket() {
         return Err(ControlError::PathOccupied(path.to_path_buf()));
     }
-    fs::remove_file(path).map_err(|source| ControlError::RemoveStaleSocket {
-        path: path.to_path_buf(),
-        source,
-    })
+    Ok(())
 }
 
 fn secure_socket(listener: UnixListener, path: &Path) -> Result<UnixListener, ControlError> {
@@ -385,13 +400,16 @@ mod tests {
             net::{UnixListener, UnixStream},
         },
         path::Path,
-        sync::{Arc, atomic::AtomicBool},
         thread,
         time::{Duration, Instant},
     };
 
+    #[cfg(target_os = "linux")]
     use rustix::process::{Pid, Signal, kill_process};
+    #[cfg(target_os = "linux")]
     use signal_hook::consts::signal::SIGUSR2;
+    #[cfg(target_os = "linux")]
+    use std::sync::{Arc, atomic::AtomicBool};
     use tempfile::TempDir;
 
     use super::{
@@ -408,12 +426,48 @@ mod tests {
 
         let result = send_command_at(&path, &[b'x'; 65]);
 
-        assert!(matches!(result, Err(ControlError::ServerRejected(message))
-            if message == "control request is too large"));
+        assert!(
+            matches!(&result, Err(ControlError::ServerRejected(message))
+            if message == "control request is too large"),
+            "{result:?}"
+        );
         assert!(matches!(
             events.try_recv(),
             Err(std::sync::mpsc::TryRecvError::Empty)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn fast_peer_close_still_requires_a_valid_nonempty_reply() -> Result<(), Box<dyn Error>> {
+        for response in [b"".as_slice(), b"\xff".as_slice(), b"ok\n".as_slice()] {
+            let temp = TempDir::new()?;
+            let path = temp.path().join("control.sock");
+            let listener = UnixListener::bind(&path)?;
+            let server = thread::spawn(move || -> std::io::Result<()> {
+                let (mut stream, _) = listener.accept()?;
+                let mut request = [0_u8; STATUS_COMMAND.len()];
+                stream.read_exact(&mut request)?;
+                assert_eq!(request, STATUS_COMMAND);
+                // reply without waiting for the client's write-side shutdown
+                stream.write_all(response)
+            });
+            let result = send_command_at(&path, STATUS_COMMAND);
+            server
+                .join()
+                .unwrap_or_else(|_| panic!("server panicked"))?;
+            match response {
+                [] => assert!(
+                    matches!(&result, Err(ControlError::EmptyResponse)),
+                    "{result:?}"
+                ),
+                [0xff] => assert!(
+                    matches!(&result, Err(ControlError::InvalidResponse)),
+                    "{result:?}"
+                ),
+                _ => assert_eq!(result?, "ok\n"),
+            }
+        }
         Ok(())
     }
 
@@ -499,6 +553,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn interrupted_poll_keeps_the_worker_serving() -> Result<(), Box<dyn Error>> {
         let temp = TempDir::new()?;
         let path = temp.path().join("control.sock");
@@ -529,6 +584,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
     fn control_worker_tids() -> std::io::Result<Vec<Pid>> {
         let mut tids = Vec::new();
         for entry in fs::read_dir("/proc/self/task")? {

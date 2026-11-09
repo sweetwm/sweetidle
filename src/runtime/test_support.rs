@@ -13,7 +13,12 @@ use crate::test_support::TestDeadline;
 
 pub(super) fn new_event_loop() -> EventLoop<'static, RuntimeState> {
     match EventLoop::try_new() {
-        Ok(event_loop) => event_loop,
+        Ok(event_loop) => {
+            #[cfg(target_os = "freebsd")]
+            super::shutdown::register_child_source(&event_loop.handle())
+                .unwrap_or_else(|error| panic!("failed to register child signals: {error}"));
+            event_loop
+        }
         Err(error) => panic!("{error}"),
     }
 }

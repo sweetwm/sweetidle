@@ -3,6 +3,7 @@ use std::{fmt, sync::mpsc::SyncSender};
 use serde::Serialize;
 
 use crate::{
+    config::{GeneralConfig, LOGIND_SUPPORTED},
     listener::{InhibitPolicy, ListenerPhase, ListenerStatus},
     session::SystemdIdleInhibitor,
 };
@@ -46,12 +47,41 @@ pub(crate) struct DbusInhibitorStatus {
     pub(crate) reason: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum SystemdInhibitStatus {
+    Enabled,
+    Ignored,
+    Unsupported,
+}
+
+impl SystemdInhibitStatus {
+    pub(crate) fn from_config(config: &GeneralConfig) -> Self {
+        if !LOGIND_SUPPORTED {
+            Self::Unsupported
+        } else if config.ignore_systemd_inhibit {
+            Self::Ignored
+        } else {
+            Self::Enabled
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::Ignored => "ignored",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StatusSnapshot {
     pub(crate) paused: bool,
     pub(crate) listeners: Vec<ListenerStatus>,
     pub(crate) dbus_inhibitors: Vec<DbusInhibitorStatus>,
     pub(crate) systemd_inhibitors: Vec<SystemdIdleInhibitor>,
+    pub(crate) systemd_inhibit_status: SystemdInhibitStatus,
     pub(crate) idle_hint: Option<bool>,
 }
 
@@ -103,6 +133,7 @@ impl StatusSnapshot {
                 active: !self.dbus_inhibitors.is_empty() || !self.systemd_inhibitors.is_empty(),
                 dbus,
                 systemd,
+                systemd_status: self.systemd_inhibit_status,
             },
         };
         let mut response = serde_json::to_string(&status)?;
@@ -133,6 +164,7 @@ struct JsonInhibitors<'a> {
     active: bool,
     dbus: Vec<JsonDbusInhibitor<'a>>,
     systemd: Vec<JsonSystemdInhibitor<'a>>,
+    systemd_status: SystemdInhibitStatus,
 }
 
 #[derive(Serialize)]
@@ -161,6 +193,11 @@ impl fmt::Display for StatusSnapshot {
             formatter,
             "tracked inhibitors active: {}",
             !self.dbus_inhibitors.is_empty() || !self.systemd_inhibitors.is_empty()
+        )?;
+        writeln!(
+            formatter,
+            "systemd idle inhibitors: {}",
+            self.systemd_inhibit_status.label()
         )?;
         match self.idle_hint {
             Some(idle) => writeln!(
@@ -225,11 +262,35 @@ fn listener_phase_label(phase: ListenerPhase) -> &'static str {
 mod tests {
     use std::time::Duration;
 
-    use super::{DbusInhibitorStatus, StatusFormat, StatusSnapshot};
+    use super::{DbusInhibitorStatus, StatusFormat, StatusSnapshot, SystemdInhibitStatus};
     use crate::{
+        config::{GeneralConfig, LOGIND_SUPPORTED},
         listener::{InhibitPolicy, ListenerId, ListenerPhase, ListenerStatus},
         session::SystemdIdleInhibitor,
     };
+
+    #[test]
+    fn distinguishes_unsupported_and_ignored_systemd_inhibitors() {
+        for ignored in [false, true] {
+            let config = GeneralConfig {
+                ignore_systemd_inhibit: ignored,
+                ..GeneralConfig::default()
+            };
+            let status = SystemdInhibitStatus::from_config(&config);
+            let expected = if !LOGIND_SUPPORTED {
+                "unsupported"
+            } else if ignored {
+                "ignored"
+            } else {
+                "enabled"
+            };
+            assert_eq!(status.label(), expected);
+            assert_eq!(
+                serde_json::to_value(status).unwrap_or_else(|error| panic!("{error}")),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn formats_each_listener_phase_and_policy_in_both_status_formats() {
@@ -273,13 +334,14 @@ mod tests {
                 }],
                 dbus_inhibitors: Vec::new(),
                 systemd_inhibitors: Vec::new(),
+                systemd_inhibit_status: SystemdInhibitStatus::Enabled,
                 idle_hint: None,
             };
 
             assert_eq!(
                 status.to_string(),
                 format!(
-                    "sweetidle: running\ntracked inhibitors active: false\nidle hint: disabled\nlisteners:\n  - id=0 state={state_label} timeout=300s inhibitors={policy_label}\ntracked inhibitors: none\n"
+                    "sweetidle: running\ntracked inhibitors active: false\nsystemd idle inhibitors: enabled\nidle hint: disabled\nlisteners:\n  - id=0 state={state_label} timeout=300s inhibitors={policy_label}\ntracked inhibitors: none\n"
                 )
             );
             let rendered = status
@@ -314,6 +376,7 @@ mod tests {
                 application: "video player".to_string(),
                 reason: "playing\nmedia".to_string(),
             }],
+            systemd_inhibit_status: SystemdInhibitStatus::Enabled,
             systemd_inhibitors: vec![SystemdIdleInhibitor {
                 who: "backup".to_string(),
                 why: "saving files".to_string(),
@@ -328,6 +391,7 @@ mod tests {
             concat!(
                 "sweetidle: paused\n",
                 "tracked inhibitors active: true\n",
+                "systemd idle inhibitors: enabled\n",
                 "idle hint: active\n",
                 "listeners:\n",
                 "  - id=0 state=timed-out timeout=300s inhibitors=ignored\n",
@@ -353,6 +417,7 @@ mod tests {
                 application: "video player".to_string(),
                 reason: "playing\nmedia".to_string(),
             }],
+            systemd_inhibit_status: SystemdInhibitStatus::Enabled,
             systemd_inhibitors: vec![SystemdIdleInhibitor {
                 who: "backup".to_string(),
                 why: "saving files".to_string(),
@@ -387,6 +452,7 @@ mod tests {
                         "application": "video player",
                         "reason": "playing\nmedia"
                     }],
+                    "systemd_status": "enabled",
                     "systemd": [{
                         "pid": 42,
                         "uid": 1000,

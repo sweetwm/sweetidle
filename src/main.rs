@@ -75,6 +75,8 @@ fn run_daemon(path: Option<PathBuf>, verbose: bool) -> Result<(), String> {
         idle_hint_timeout_seconds = ?active_config.idle_hint_timeout_seconds,
         "sweetidle started"
     );
+    #[cfg(target_os = "freebsd")]
+    info!("FreeBSD basic support: system session hooks and systemd inhibitors are unavailable");
     for event in runtime.take_startup_events() {
         handle_runtime_event(event);
     }
@@ -159,6 +161,11 @@ fn load_config(path: Option<PathBuf>) -> Result<LoadedConfig, String> {
 }
 
 fn missing_config_hint(path: &Path) -> String {
+    let name = if cfg!(target_os = "freebsd") {
+        "freebsd.toml"
+    } else {
+        "example.toml"
+    };
     // packaged builds ship the example under share/doc next to bin
     let example = std::env::current_exe()
         .ok()
@@ -166,17 +173,21 @@ fn missing_config_hint(path: &Path) -> String {
             Some(
                 exe.parent()?
                     .parent()?
-                    .join("share/doc/sweetidle/example.toml"),
+                    .join("share/doc/sweetidle")
+                    .join(name),
             )
         })
         .filter(|example| example.is_file());
     let Some(example) = example else {
         return format!(
-            "hint: copy config/example.toml from the sweetidle source to `{}`",
+            "hint: copy config/{name} from the sweetidle source to `{}`",
             path.display()
         );
     };
+    #[cfg(target_os = "freebsd")]
+    return format!("hint: copy `{}` to `{}`", example.display(), path.display());
     // install makes the parent directory and drops the read-only nix store mode
+    #[cfg(not(target_os = "freebsd"))]
     format!(
         "hint: start from the example config:\n  install -Dm644 '{}' '{}'",
         example.display(),

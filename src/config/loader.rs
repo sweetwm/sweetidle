@@ -38,10 +38,13 @@ impl Config {
         let source = std::str::from_utf8(&bytes)
             .map_err(|source| read_error(io::Error::new(io::ErrorKind::InvalidData, source)))?;
 
-        Self::parse(source).map_err(|source| ConfigLoadError::Invalid {
+        let invalid = |source| ConfigLoadError::Invalid {
             path: path.to_path_buf(),
             source,
-        })
+        };
+        let config = Self::parse(source).map_err(invalid)?;
+        config.validate_platform().map_err(invalid)?;
+        Ok(config)
     }
 }
 

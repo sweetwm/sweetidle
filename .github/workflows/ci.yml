@@ -86,3 +86,30 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release
+
+  freebsd:
+    name: FreeBSD
+    if: vars.RUN_CI == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start FreeBSD VM
+        uses: cross-platform-actions/action@v1.6.0
+        with:
+          operating_system: freebsd
+          version: '15.1'
+          memory: 4G
+          cpu_count: 2
+      - name: Check native build and isolated integrations
+        shell: cpa.sh {0}
+        run: |
+          set -eu
+          sudo pkg install -y rust dbus
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+          cargo test --locked --test reload -- --ignored --test-threads=1
+          dbus-run-session -- cargo test --locked --lib session::screensaver::tests -- --ignored --test-threads=1
+          cargo build --release --locked
+          target/release/sweetidle --config config/freebsd.toml --check-config

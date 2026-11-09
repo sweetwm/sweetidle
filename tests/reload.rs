@@ -26,7 +26,8 @@ use wayland_server::{
 const WAIT_LIMIT: Duration = Duration::from_secs(5);
 // some launchers leave SIGCHLD ignored, which survives exec
 const IGNORE_SIGCHLD: &str = "trap '' CHLD; exec \"$0\" \"$@\"";
-const SIGCHLD_MASK: u64 = 1 << (17 - 1);
+#[cfg(target_os = "linux")]
+const SIGCHLD_MASK: u64 = 1 << (signal_hook::consts::signal::SIGCHLD - 1);
 
 #[test]
 #[ignore = "runs the real daemon against a private Wayland compositor"]
@@ -359,7 +360,11 @@ fn ignored_sigchld_from_the_launcher_does_not_stop_command_reaping() -> Result<(
     harness.wait_for_log("command finished")?;
     harness.resume_listener_cycle()?;
     let marker_path = shell_quote(path_text(&harness.marker_path)?);
+    #[cfg(target_os = "linux")]
     let command = format!("grep SigIgn /proc/self/status >> {marker_path}");
+    #[cfg(target_os = "freebsd")]
+    let command =
+        format!("sh -c 'sleep 0.01 & wait $!' && printf 'child-waited\\n' >> {marker_path}");
     fs::write(
         &harness.config_path,
         format!(
@@ -372,11 +377,16 @@ fn ignored_sigchld_from_the_launcher_does_not_stop_command_reaping() -> Result<(
 
     // hooks must start with default SIGCHLD, whatever the daemon inherited
     let markers = harness.markers()?;
-    let ignored = markers[1]
-        .strip_prefix("SigIgn:")
-        .ok_or("hook did not report its ignored signals")?;
-    let ignored = u64::from_str_radix(ignored.trim(), 16)?;
-    assert_eq!(ignored & SIGCHLD_MASK, 0, "hook inherited ignored SIGCHLD");
+    #[cfg(target_os = "linux")]
+    {
+        let ignored = markers[1]
+            .strip_prefix("SigIgn:")
+            .ok_or("hook did not report its ignored signals")?;
+        let ignored = u64::from_str_radix(ignored.trim(), 16)?;
+        assert_eq!(ignored & SIGCHLD_MASK, 0, "hook inherited ignored SIGCHLD");
+    }
+    #[cfg(target_os = "freebsd")]
+    assert_eq!(markers[1], "child-waited");
     assert!(harness.status()?.contains("sweetidle: running"));
     harness.stop()?;
     Ok(())
@@ -473,6 +483,34 @@ fn compositor_protocol_error_still_fails_the_daemon() -> Result<(), Box<dyn Erro
         !log.contains("compositor closed the Wayland connection"),
         "{log}"
     );
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "freebsd")]
+#[ignore = "runs the real daemon against a private Wayland compositor"]
+fn unsupported_session_reload_keeps_idle_actions_and_can_recover() -> Result<(), Box<dyn Error>> {
+    let mut harness = ReloadHarness::start("active")?;
+    harness.wait_for_markers(1)?;
+    let original = fs::read_to_string(&harness.config_path)?;
+    fs::write(
+        &harness.config_path,
+        original.replace("[general]", "[general]\nbefore_sleep_command = 'exit 0'"),
+    )?;
+    harness.signal_reload()?;
+    harness.wait_for_log("not supported on freebsd")?;
+    assert_eq!(harness.compositor.pulse(1)?, 1);
+    harness.wait_for_markers(2)?;
+    assert_eq!(harness.markers()?, ["active", "active"]);
+
+    harness.resume_listener_cycle()?;
+    harness.write_config("recovered")?;
+    harness.signal_reload()?;
+    harness.wait_for_markers(3)?;
+    assert_eq!(harness.markers()?, ["active", "active", "recovered"]);
+    let status: serde_json::Value = serde_json::from_str(&harness.status_json()?)?;
+    assert_eq!(status["inhibitors"]["systemd_status"], "unsupported");
+    harness.stop()?;
     Ok(())
 }
 

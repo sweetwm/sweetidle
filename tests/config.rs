@@ -89,7 +89,11 @@ fn missing_config_suggests_the_example() -> Result<(), Box<dyn Error>> {
     let stderr = String::from_utf8(output.stderr)?;
     assert!(stderr.contains("No such file or directory"), "{stderr}");
     assert!(
-        stderr.contains("hint: copy config/example.toml"),
+        stderr.contains(if cfg!(target_os = "freebsd") {
+            "hint: copy config/freebsd.toml"
+        } else {
+            "hint: copy config/example.toml"
+        }),
         "{stderr}"
     );
     Ok(())
@@ -149,5 +153,61 @@ fn non_utf8_unknown_argument_is_a_usage_error() -> Result<(), Box<dyn Error>> {
         String::from_utf8(output.stderr)?,
         "error: unknown argument `--bad-\u{fffd}`\ntry `sweetidle --help`\n"
     );
+    Ok(())
+}
+
+#[test]
+fn checks_the_freebsd_example_without_a_desktop() -> Result<(), Box<dyn Error>> {
+    let output = Command::new(env!("CARGO_BIN_EXE_sweetidle"))
+        .args(["--check-config", "--config", "config/freebsd.toml"])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "freebsd")]
+fn rejects_unsupported_hooks_before_connecting_to_a_desktop() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("config.toml");
+    for (source, field) in [
+        (
+            "[general]\nlock_command = 'exit 0'\n",
+            "general.lock_command",
+        ),
+        (
+            "[general]\nunlock_command = 'exit 0'\n",
+            "general.unlock_command",
+        ),
+        (
+            "[general]\nbefore_sleep_command = 'exit 0'\n",
+            "general.before_sleep_command",
+        ),
+        (
+            "[general]\nafter_resume_command = 'exit 0'\n",
+            "general.after_resume_command",
+        ),
+        ("[idle_hint]\ntimeout = 30\n", "idle_hint"),
+    ] {
+        fs::write(&path, source)?;
+        for check in [true, false] {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_sweetidle"));
+            command
+                .arg("--config")
+                .arg(&path)
+                .env_remove("WAYLAND_DISPLAY")
+                .env_remove("XDG_RUNTIME_DIR");
+            if check {
+                command.arg("--check-config");
+            }
+            let output = command.output()?;
+            assert_eq!(output.status.code(), Some(2));
+            let stderr = String::from_utf8(output.stderr)?;
+            assert!(
+                stderr.contains(field) && stderr.contains("not supported on freebsd"),
+                "{stderr}"
+            );
+        }
+    }
     Ok(())
 }
