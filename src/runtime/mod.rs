@@ -23,7 +23,7 @@ use self::{
 };
 use crate::{
     command::{FinishedCommand, ProcessCompletion, ProcessError, ProcessStart, SkipDecision},
-    config::{Config, ConfigLoadError},
+    config::{Config, ConfigLoadError, LOGIND_SUPPORTED},
     control::ControlMonitor,
     listener::{ListenerError, ListenerSet},
     session::{
@@ -107,6 +107,7 @@ pub struct IdleRuntime {
 
 impl IdleRuntime {
     pub fn connect(config: &Config, config_path: PathBuf) -> Result<Self, RuntimeError> {
+        config.validate_platform().map_err(RuntimeError::Config)?;
         let listeners = ListenerSet::from_config(config);
         let idle_hint_timeout = config.idle_hint_timeout_seconds.map(Duration::from_secs);
         let event_loop = EventLoop::try_new().map_err(RuntimeError::CreateEventLoop)?;
@@ -191,6 +192,9 @@ impl IdleRuntime {
         &mut self,
         candidate: &Config,
     ) -> Result<ConfigReloadOutcome, RuntimeError> {
+        if let Err(error) = candidate.validate_platform() {
+            return Ok(ConfigReloadOutcome::Rejected(RuntimeError::Config(error)));
+        }
         // changing integration workers needs a full restart
         let candidate_features = IntegrationFeatures::from_config(candidate);
         if let Some(reason) = reload_restart_reason(self.integration_features, candidate_features) {
@@ -339,6 +343,10 @@ fn register_logind(
 }
 
 fn logind_features(config: &Config) -> Option<LogindFeatures> {
+    requested_logind_features(config).filter(|_| LOGIND_SUPPORTED)
+}
+
+fn requested_logind_features(config: &Config) -> Option<LogindFeatures> {
     let has_before_sleep = config.general.before_sleep_command.is_some();
     let has_after_resume = config.general.after_resume_command.is_some();
     let session_events =
@@ -359,10 +367,37 @@ fn logind_features(config: &Config) -> Option<LogindFeatures> {
 #[cfg(test)]
 mod tests {
     use super::{
-        IntegrationFeatures, dbus_inhibit_enabled, logind_features, reload_restart_reason,
+        IntegrationFeatures, dbus_inhibit_enabled, reload_restart_reason,
+        requested_logind_features as logind_features,
     };
     use crate::config::Config;
     use crate::session::LogindFeatures;
+
+    #[test]
+    fn selects_system_integration_only_on_supported_platforms() {
+        assert_eq!(
+            IntegrationFeatures::from_config(&Config::default())
+                .logind
+                .is_some(),
+            crate::config::LOGIND_SUPPORTED
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "freebsd")]
+    fn rejects_programmatic_session_hooks_before_registering_runtime_sources() {
+        let mut config = Config::default();
+        config.general.before_sleep_command = Some("exit 0".into());
+        assert!(matches!(
+            super::IdleRuntime::connect(&config, "unused.toml".into()),
+            Err(super::RuntimeError::Config(
+                crate::config::ConfigError::Unsupported {
+                    field: "general.before_sleep_command",
+                    ..
+                }
+            ))
+        ));
+    }
 
     #[test]
     fn starts_logind_without_an_inhibitor_for_fire_and_forget_hooks() {
@@ -525,6 +560,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn enabling_a_new_logind_feature_requires_restart() {
         let mut active = Config::default();
         active.general.ignore_systemd_inhibit = true;

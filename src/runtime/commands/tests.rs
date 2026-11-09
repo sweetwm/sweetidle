@@ -1,7 +1,10 @@
 use std::io::{self, Read};
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
 use calloop::{EventLoop, Interest, Mode, PostAction, generic::Generic};
+#[cfg(target_os = "linux")]
 use rustix::process::{Pid, PidfdFlags, pidfd_open};
 
 use crate::{
@@ -20,7 +23,7 @@ use crate::{
 };
 
 #[test]
-fn launches_and_reaps_commands_through_pidfds() -> Result<(), RuntimeError> {
+fn launches_and_reaps_commands_through_event_notifications() -> Result<(), RuntimeError> {
     let mut event_loop = new_event_loop();
     let mut state = runtime_state();
     let mut events = Vec::new();
@@ -117,6 +120,7 @@ fn failed_sleep_hook_releases_its_slot_and_inhibitor_without_command_text()
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn late_pidfd_callback_does_not_repeat_an_already_collected_completion()
 -> Result<(), Box<dyn std::error::Error>> {
     let event_loop = new_event_loop();
@@ -143,7 +147,7 @@ fn late_pidfd_callback_does_not_repeat_an_already_collected_completion()
 
     // both children have exited, but only the first callback has reached the runtime
     events.clear();
-    state.commands.mark_process_ready(starts[0].command_id);
+    state.commands.completions.record(starts[0].command_id);
     state.commands.collect_ready_processes(&mut events)?;
     assert_eq!(events.len(), 2);
     for start in &starts {
@@ -153,13 +157,14 @@ fn late_pidfd_callback_does_not_repeat_an_already_collected_completion()
         )));
     }
     events.clear();
-    state.commands.mark_process_ready(starts[1].command_id);
+    state.commands.completions.record(starts[1].command_id);
     state.commands.collect_ready_processes(&mut events)?;
     assert!(events.is_empty());
     assert!(state.commands.is_empty());
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn wait_for_exit(process_id: u32) -> Result<(), Box<dyn std::error::Error>> {
     let pid = i32::try_from(process_id)
         .ok()
@@ -199,4 +204,65 @@ fn intent(command: &str) -> CommandIntent {
         kind: CommandKind::Timeout,
         command: command.to_string(),
     }
+}
+
+#[test]
+fn concurrent_fast_exits_release_every_command_slot_once() -> Result<(), RuntimeError> {
+    let mut event_loop = new_event_loop();
+    let mut state = runtime_state();
+    let mut events = Vec::new();
+    for index in 0..32 {
+        let mut request = intent("exit 0");
+        request.listener_id = ListenerId::from_index(index);
+        state
+            .commands
+            .dispatch_listener(&event_loop.handle(), request, &mut events)?;
+    }
+    assert_eq!(events.len(), 32);
+    let mut completed = std::collections::HashSet::new();
+    while completed.len() < 32 {
+        for event in wait_for_process_events(&mut event_loop, &mut state) {
+            let RuntimeEvent::CommandFinished {
+                command,
+                completion,
+            } = event
+            else {
+                panic!("unexpected child event: {event:?}");
+            };
+            assert!(completion.status.success());
+            assert!(completed.insert(command.command_id));
+        }
+    }
+    assert!(state.commands.is_empty());
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "freebsd")]
+fn child_exit_wakes_the_loop_after_a_running_child_scan() -> Result<(), RuntimeError> {
+    let mut event_loop = new_event_loop();
+    let mut state = runtime_state();
+    let mut events = Vec::new();
+    state
+        .commands
+        .dispatch_listener(&event_loop.handle(), intent("sleep 0.2"), &mut events)?;
+    events.clear();
+    state.commands.collect_ready_processes(&mut events)?;
+    assert!(events.is_empty());
+    assert_eq!(state.commands.running_count(), 1);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while events.is_empty() {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(!remaining.is_zero(), "SIGCHLD did not wake the loop");
+        event_loop
+            .dispatch(Some(remaining), &mut state)
+            .map_err(RuntimeError::Dispatch)?;
+        state.commands.collect_ready_processes(&mut events)?;
+    }
+    assert!(
+        matches!(events.as_slice(), [RuntimeEvent::CommandFinished { completion, .. }] if completion.status.success())
+    );
+    assert!(state.commands.is_empty());
+    Ok(())
 }

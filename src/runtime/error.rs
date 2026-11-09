@@ -2,6 +2,7 @@ use std::{error::Error, fmt, io};
 
 use crate::{
     command::{CommandDispatchError, CommandId, ProcessError},
+    config::ConfigError,
     control::ControlError,
     listener::{ListenerError, ListenerId},
     session::{DbusInhibitError, SessionError},
@@ -11,6 +12,7 @@ use crate::{
 // keep errors typed across event sources until the binary logs them
 #[derive(Debug)]
 pub enum RuntimeError {
+    Config(ConfigError),
     Wayland(IdleWaylandError),
     CreateEventLoop(calloop::Error),
     RegisterWayland(calloop::Error),
@@ -61,6 +63,7 @@ pub enum RuntimeError {
 impl fmt::Display for RuntimeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Config(source) => write!(formatter, "invalid runtime configuration: {source}"),
             Self::Wayland(source) => {
                 write!(formatter, "Wayland idle protocol failed: {source}")
             }
@@ -179,6 +182,7 @@ impl fmt::Display for RuntimeError {
 impl Error for RuntimeError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Config(source) => Some(source),
             Self::Wayland(source) => Some(source),
             Self::CreateEventLoop(source)
             | Self::RegisterWayland(source)

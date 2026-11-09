@@ -11,7 +11,7 @@ use super::{
 use crate::{
     command::CommandContext,
     config::{Config, GeneralConfig},
-    control::{ControlEvent, DbusInhibitorStatus, StatusSnapshot},
+    control::{ControlEvent, DbusInhibitorStatus, StatusSnapshot, SystemdInhibitStatus},
     listener::{CommandIntent, InhibitPolicy, ListenerSet},
     session::{DbusInhibitEvent, DelayInhibitor, SessionEvent},
     wayland::{IdleEvent, IdleWaylandState},
@@ -37,6 +37,7 @@ pub(super) struct RuntimeState {
     reload_pending: bool,
     reload_rerequested: bool,
     inhibition: InhibitionState,
+    systemd_inhibit_status: SystemdInhibitStatus,
     idle_hint_state: Option<bool>,
     idle_hint_updates: Vec<bool>,
     preparing_for_sleep: bool,
@@ -72,6 +73,7 @@ impl RuntimeState {
             reload_pending: false,
             reload_rerequested: false,
             inhibition: InhibitionState::default(),
+            systemd_inhibit_status: SystemdInhibitStatus::from_config(&config.general),
             idle_hint_state: config.idle_hint_timeout_seconds.map(|_| false),
             idle_hint_updates: Vec::new(),
             preparing_for_sleep: false,
@@ -120,6 +122,7 @@ impl RuntimeState {
         self.commands.remap_listener_slots(&reload.matching_ids);
         self.listeners = reload.listeners;
         self.session_commands = SessionCommands::from(&config.general);
+        self.systemd_inhibit_status = SystemdInhibitStatus::from_config(&config.general);
         self.set_idle_hint(false);
 
         Ok(())
@@ -530,6 +533,7 @@ impl RuntimeState {
             listeners: self.listeners.status(),
             dbus_inhibitors,
             systemd_inhibitors: self.inhibition.systemd_details().to_vec(),
+            systemd_inhibit_status: self.systemd_inhibit_status,
             idle_hint: self.idle_hint_state,
         }
     }

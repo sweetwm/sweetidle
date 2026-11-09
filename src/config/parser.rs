@@ -10,8 +10,18 @@ const MAX_TIMEOUT_SECONDS: u64 = u32::MAX as u64 / 1000;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigError {
     Parse(String),
-    MissingField { table: String, field: String },
-    InvalidValue { field: String, reason: String },
+    MissingField {
+        table: String,
+        field: String,
+    },
+    InvalidValue {
+        field: String,
+        reason: String,
+    },
+    Unsupported {
+        field: &'static str,
+        platform: &'static str,
+    },
 }
 
 impl Config {
@@ -49,6 +59,10 @@ impl fmt::Display for ConfigError {
             Self::InvalidValue { field, reason } => {
                 write!(formatter, "`{field}` is invalid: {reason}")
             }
+            Self::Unsupported { field, platform } => write!(
+                formatter,
+                "`{field}` is not supported on {platform}; system session hooks and idle hints require the Linux logind backend"
+            ),
         }
     }
 }

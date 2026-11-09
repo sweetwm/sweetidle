@@ -1,0 +1,13 @@
+# Basic FreeBSD configuration: start sweetidle inside your Wayland session.
+# Install a compatible locker before enabling the lock listener below.
+# System sleep/session hooks and idle hints are not supported on FreeBSD yet.
+
+[[listener]]
+timeout = 300
+on_timeout = "veila lock --wait-ready"
+ignore_inhibit = true
+
+[[listener]]
+timeout = 600
+on_timeout = "sweets msg output-power '*' off"
+on_resume = "sweets msg output-power '*' on"
