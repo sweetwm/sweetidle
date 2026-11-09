@@ -103,6 +103,7 @@ pub struct IdleRuntime {
     logind: Option<LogindMonitor>,
     _dbus_inhibit: Option<DbusInhibitMonitor>,
     _control: ControlMonitor,
+    _sleep_control: Option<ControlMonitor>,
 }
 
 impl IdleRuntime {
@@ -113,7 +114,12 @@ impl IdleRuntime {
         let event_loop = EventLoop::try_new().map_err(RuntimeError::CreateEventLoop)?;
         register_sources(&event_loop.handle())?;
         // the socket is the single-instance guard, so claim it before any shared side effect
-        let control = register_control(&event_loop)?;
+        let control = register_control(&event_loop, false)?;
+        let sleep_control = if freebsd_sleep_enabled(config) {
+            Some(register_control(&event_loop, true)?)
+        } else {
+            None
+        };
         let parts = IdleWaylandParts::connect(&listeners.timeout_requests(), idle_hint_timeout)?;
         let connection = parts.connection.clone();
         let protocol_errors = parts.connection.clone();
@@ -151,6 +157,7 @@ impl IdleRuntime {
             logind,
             _dbus_inhibit: dbus_inhibit,
             _control: control,
+            _sleep_control: sleep_control,
         })
     }
 
@@ -242,8 +249,14 @@ impl IdleRuntime {
 
 fn register_control(
     event_loop: &EventLoop<'static, RuntimeState>,
+    sleep: bool,
 ) -> Result<ControlMonitor, RuntimeError> {
-    let (monitor, source) = ControlMonitor::connect().map_err(RuntimeError::Control)?;
+    let (monitor, source) = if sleep {
+        ControlMonitor::connect_sleep()
+    } else {
+        ControlMonitor::connect()
+    }
+    .map_err(RuntimeError::Control)?;
     event_loop
         .handle()
         .insert_source(source, |event, _, state: &mut RuntimeState| match event {
@@ -258,6 +271,7 @@ fn register_control(
 struct IntegrationFeatures {
     dbus_inhibit: bool,
     logind: Option<LogindFeatures>,
+    freebsd_sleep: bool,
 }
 
 impl IntegrationFeatures {
@@ -265,6 +279,7 @@ impl IntegrationFeatures {
         Self {
             dbus_inhibit: dbus_inhibit_enabled(config),
             logind: logind_features(config),
+            freebsd_sleep: freebsd_sleep_enabled(config),
         }
     }
 }
@@ -273,7 +288,9 @@ fn reload_restart_reason(
     active: IntegrationFeatures,
     candidate: IntegrationFeatures,
 ) -> Option<&'static str> {
-    if active.dbus_inhibit != candidate.dbus_inhibit {
+    if active.freebsd_sleep != candidate.freebsd_sleep {
+        Some("changing FreeBSD sleep integration")
+    } else if active.dbus_inhibit != candidate.dbus_inhibit {
         Some("changing D-Bus inhibitor monitoring")
     } else if active.logind != candidate.logind {
         Some("changing logind integration features")
@@ -342,6 +359,12 @@ fn register_logind(
     Ok(Some(monitor))
 }
 
+fn freebsd_sleep_enabled(config: &Config) -> bool {
+    cfg!(target_os = "freebsd")
+        && (config.general.before_sleep_command.is_some()
+            || config.general.after_resume_command.is_some())
+}
+
 fn logind_features(config: &Config) -> Option<LogindFeatures> {
     requested_logind_features(config).filter(|_| LOGIND_SUPPORTED)
 }
@@ -387,12 +410,12 @@ mod tests {
     #[cfg(target_os = "freebsd")]
     fn rejects_programmatic_session_hooks_before_registering_runtime_sources() {
         let mut config = Config::default();
-        config.general.before_sleep_command = Some("exit 0".into());
+        config.general.lock_command = Some("exit 0".into());
         assert!(matches!(
             super::IdleRuntime::connect(&config, "unused.toml".into()),
             Err(super::RuntimeError::Config(
                 crate::config::ConfigError::Unsupported {
-                    field: "general.before_sleep_command",
+                    field: "general.lock_command",
                     ..
                 }
             ))

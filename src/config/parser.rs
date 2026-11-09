@@ -61,7 +61,7 @@ impl fmt::Display for ConfigError {
             }
             Self::Unsupported { field, platform } => write!(
                 formatter,
-                "`{field}` is not supported on {platform}; system session hooks and idle hints require the Linux logind backend"
+                "`{field}` is not supported on {platform}; this feature requires the Linux logind backend"
             ),
         }
     }

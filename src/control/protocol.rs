@@ -16,6 +16,11 @@ pub(crate) enum ControlEvent {
     Pause(ControlRequest),
     Resume(ControlRequest),
     Reload(ControlRequest),
+    Sleep {
+        event: super::SleepEvent,
+        cycle: super::SleepCycleId,
+        request: Option<ControlRequest>,
+    },
     Failed(super::ControlError),
 }
 
@@ -78,6 +83,7 @@ impl SystemdInhibitStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StatusSnapshot {
     pub(crate) paused: bool,
+    pub(crate) preparing_for_sleep: bool,
     pub(crate) listeners: Vec<ListenerStatus>,
     pub(crate) dbus_inhibitors: Vec<DbusInhibitorStatus>,
     pub(crate) systemd_inhibitors: Vec<SystemdIdleInhibitor>,
@@ -127,6 +133,7 @@ impl StatusSnapshot {
         let status = JsonStatus {
             schema_version: 1,
             paused: self.paused,
+            preparing_for_sleep: self.preparing_for_sleep,
             idle_hint: self.idle_hint,
             listeners,
             inhibitors: JsonInhibitors {
@@ -146,6 +153,7 @@ impl StatusSnapshot {
 struct JsonStatus<'a> {
     schema_version: u8,
     paused: bool,
+    preparing_for_sleep: bool,
     idle_hint: Option<bool>,
     listeners: Vec<JsonListenerStatus>,
     inhibitors: JsonInhibitors<'a>,
@@ -198,6 +206,15 @@ impl fmt::Display for StatusSnapshot {
             formatter,
             "systemd idle inhibitors: {}",
             self.systemd_inhibit_status.label()
+        )?;
+        writeln!(
+            formatter,
+            "sleep preparation: {}",
+            if self.preparing_for_sleep {
+                "active"
+            } else {
+                "inactive"
+            }
         )?;
         match self.idle_hint {
             Some(idle) => writeln!(
@@ -326,6 +343,7 @@ mod tests {
         ] {
             let status = StatusSnapshot {
                 paused: false,
+                preparing_for_sleep: false,
                 listeners: vec![ListenerStatus {
                     listener_id: ListenerId::from_index(0),
                     timeout: Duration::from_secs(300),
@@ -341,7 +359,7 @@ mod tests {
             assert_eq!(
                 status.to_string(),
                 format!(
-                    "sweetidle: running\ntracked inhibitors active: false\nsystemd idle inhibitors: enabled\nidle hint: disabled\nlisteners:\n  - id=0 state={state_label} timeout=300s inhibitors={policy_label}\ntracked inhibitors: none\n"
+                    "sweetidle: running\ntracked inhibitors active: false\nsystemd idle inhibitors: enabled\nsleep preparation: inactive\nidle hint: disabled\nlisteners:\n  - id=0 state={state_label} timeout=300s inhibitors={policy_label}\ntracked inhibitors: none\n"
                 )
             );
             let rendered = status
@@ -365,6 +383,7 @@ mod tests {
     fn formats_listener_and_inhibitor_details() {
         let status = StatusSnapshot {
             paused: true,
+            preparing_for_sleep: false,
             listeners: vec![ListenerStatus {
                 listener_id: ListenerId::from_index(0),
                 timeout: Duration::from_secs(300),
@@ -392,6 +411,7 @@ mod tests {
                 "sweetidle: paused\n",
                 "tracked inhibitors active: true\n",
                 "systemd idle inhibitors: enabled\n",
+                "sleep preparation: inactive\n",
                 "idle hint: active\n",
                 "listeners:\n",
                 "  - id=0 state=timed-out timeout=300s inhibitors=ignored\n",
@@ -406,6 +426,7 @@ mod tests {
     fn formats_machine_readable_status_as_json() {
         let status = StatusSnapshot {
             paused: true,
+            preparing_for_sleep: false,
             listeners: vec![ListenerStatus {
                 listener_id: ListenerId::from_index(0),
                 timeout: Duration::from_secs(300),
@@ -438,6 +459,7 @@ mod tests {
             serde_json::json!({
                 "schema_version": 1,
                 "paused": true,
+                "preparing_for_sleep": false,
                 "idle_hint": false,
                 "listeners": [{
                     "id": 0,

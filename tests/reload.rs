@@ -1,3 +1,7 @@
+#[cfg(target_os = "freebsd")]
+#[path = "reload/sleep.rs"]
+mod sleep;
+
 use std::{
     error::Error,
     fs::{self, File},
@@ -495,7 +499,7 @@ fn unsupported_session_reload_keeps_idle_actions_and_can_recover() -> Result<(),
     let original = fs::read_to_string(&harness.config_path)?;
     fs::write(
         &harness.config_path,
-        original.replace("[general]", "[general]\nbefore_sleep_command = 'exit 0'"),
+        original.replace("[general]", "[general]\nlock_command = 'exit 0'"),
     )?;
     harness.signal_reload()?;
     harness.wait_for_log("not supported on freebsd")?;
@@ -554,6 +558,22 @@ impl ReloadHarness {
         notifier_version: u32,
         launcher: &str,
     ) -> Result<Self, Box<dyn Error>> {
+        Self::start_with_general(
+            initial_marker,
+            resume_marker,
+            notifier_version,
+            launcher,
+            "",
+        )
+    }
+
+    fn start_with_general(
+        initial_marker: &str,
+        resume_marker: Option<&str>,
+        notifier_version: u32,
+        launcher: &str,
+        general: &str,
+    ) -> Result<Self, Box<dyn Error>> {
         let temp_dir = tempfile::tempdir()?;
         let config_path = temp_dir.path().join("config.toml");
         let marker_path = temp_dir.path().join("commands.log");
@@ -568,6 +588,13 @@ impl ReloadHarness {
             resume_marker,
         )?;
 
+        if !general.is_empty() {
+            let source = fs::read_to_string(&config_path)?;
+            fs::write(
+                &config_path,
+                source.replace("[general]", &format!("[general]\n{general}")),
+            )?;
+        }
         let log = File::create(&log_path)?;
         let log_stdout = log.try_clone()?;
         // the launcher shell execs the daemon, so the child PID stays the daemon's

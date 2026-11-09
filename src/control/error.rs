@@ -3,6 +3,8 @@ use std::{error::Error, fmt, io, path::PathBuf};
 // retain socket paths and source errors for useful control diagnostics
 #[derive(Debug)]
 pub enum ControlError {
+    SleepEventsUnsupported,
+    InvalidSleepCycle,
     MissingRuntimeDirectory,
     RelativeRuntimeDirectory(PathBuf),
     AlreadyRunning(PathBuf),
@@ -29,6 +31,14 @@ pub enum ControlError {
 impl fmt::Display for ControlError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidSleepCycle => write!(
+                formatter,
+                "sleep cycle IDs must contain 1-40 ASCII letters, digits, hyphens, or underscores"
+            ),
+            Self::SleepEventsUnsupported => write!(
+                formatter,
+                "sleep event commands are only supported on FreeBSD"
+            ),
             Self::MissingRuntimeDirectory => write!(formatter, "XDG_RUNTIME_DIR is not set"),
             Self::RelativeRuntimeDirectory(path) => write!(
                 formatter,
@@ -126,7 +136,9 @@ impl Error for ControlError {
             | Self::WriteRequest { source }
             | Self::ReadResponse { source } => Some(source),
             Self::Poll { source } => Some(source),
-            Self::MissingRuntimeDirectory
+            Self::InvalidSleepCycle
+            | Self::SleepEventsUnsupported
+            | Self::MissingRuntimeDirectory
             | Self::RelativeRuntimeDirectory(_)
             | Self::AlreadyRunning(_)
             | Self::PathOccupied(_)

@@ -17,6 +17,7 @@ in
         ../src
         ../tests
         ../config
+        ../freebsd
         ../man
         ../systemd
       ];

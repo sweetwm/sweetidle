@@ -1,0 +1,86 @@
+#!/bin/sh
+#
+# PROVIDE: sweetidle_sleep
+# BEFORE: DAEMON
+# KEYWORD: nostart suspend resume
+#
+# enable in rc.conf and list the graphical sessions' absolute runtime directories
+
+. /etc/rc.subr
+
+name=sweetidle_sleep
+rcvar=sweetidle_sleep_enable
+start_cmd=:
+stop_cmd=:
+extra_commands="suspend resume"
+suspend_cmd=sweetidle_sleep_suspend
+resume_cmd=sweetidle_sleep_resume
+
+sweetidle_sleep_notify()
+{
+    local event limit cycle runtime count pids child failed
+    event=$1
+    limit=$2
+    cycle=$3
+    count=0
+    for runtime in $sweetidle_sleep_runtime_dirs; do
+        case "$runtime" in
+            /*) ;;
+            *) logger -t sweetidle 'runtime directories must be absolute'; return 1 ;;
+        esac
+        count=$((count + 1))
+        [ "$count" -le 16 ] || { logger -t sweetidle 'at most 16 sleep sessions are supported'; return 1; }
+    done
+    [ "$count" -gt 0 ] || { logger -t sweetidle 'sweetidle_sleep_runtime_dirs is empty'; return 1; }
+    pids=
+    for runtime in $sweetidle_sleep_runtime_dirs; do
+        # concurrent bounded clients leave time to cancel before FreeBSD's 10s force timer
+        /bin/timeout -k 1 "$limit" /usr/bin/env XDG_RUNTIME_DIR="$runtime" \
+            "$sweetidle_sleep_command" "$event" "$cycle" >/dev/null &
+        pids="$pids $!"
+    done
+    failed=0
+    for child in $pids; do
+        wait "$child" || failed=1
+    done
+    return "$failed"
+}
+
+sweetidle_sleep_suspend()
+{
+    local cycle temporary
+    checkyesno sweetidle_sleep_enable || return 0
+    cycle=$(/bin/uuidgen) || { /usr/sbin/acpiconf -k 1; return 1; }
+    temporary=$(/usr/bin/mktemp /var/run/sweetidle-sleep.XXXXXX) || { /usr/sbin/acpiconf -k 1; return 1; }
+    if ! printf '%s\n' "$cycle" > "$temporary" || ! /bin/mv -f "$temporary" /var/run/sweetidle-sleep.token; then
+        /bin/rm -f "$temporary"
+        /usr/sbin/acpiconf -k 1
+        return 1
+    fi
+    if ! sweetidle_sleep_notify before-sleep 5 "$cycle"; then
+        # returning failure alone cannot stop rc.suspend's final acknowledgment
+        /usr/sbin/acpiconf -k 1
+        logger -t sweetidle 'sleep preparation failed; requested cancellation of ACPI suspend'
+        sweetidle_sleep_notify cancel-sleep 2 "$cycle"
+        /bin/rm -f /var/run/sweetidle-sleep.token
+        return 1
+    fi
+}
+
+sweetidle_sleep_resume()
+{
+    local cycle result
+    checkyesno sweetidle_sleep_enable || return 0
+    [ -f /var/run/sweetidle-sleep.token ] || return 0
+    cycle=$(/bin/cat /var/run/sweetidle-sleep.token)
+    sweetidle_sleep_notify after-resume 2 "$cycle"
+    result=$?
+    /bin/rm -f /var/run/sweetidle-sleep.token
+    return "$result"
+}
+
+load_rc_config "$name"
+: "${sweetidle_sleep_enable:=NO}"
+: "${sweetidle_sleep_runtime_dirs:=}"
+: "${sweetidle_sleep_command:=/usr/local/bin/sweetidle}"
+run_rc_command "$1"

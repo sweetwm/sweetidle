@@ -1,6 +1,13 @@
 # Basic FreeBSD configuration: start sweetidle inside your Wayland session.
 # Install a compatible locker before enabling the lock listener below.
-# System sleep/session hooks and idle hints are not supported on FreeBSD yet.
+# Optional sleep hooks require installing and enabling freebsd/sweetidle_sleep.
+# See README.md for rc.conf setup and the four-second preparation deadline.
+# Logind lock/unlock commands and idle hints remain unsupported.
+
+# [general]
+# before_sleep_command = "swaylock -f"
+# after_resume_command = "sweets msg output-power '*' on"
+# wait_before_sleep = true
 
 [[listener]]
 timeout = 300

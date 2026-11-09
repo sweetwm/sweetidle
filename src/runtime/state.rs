@@ -1,3 +1,7 @@
+mod sleep;
+
+use sleep::SleepCycle;
+
 use std::time::Duration;
 
 use calloop::LoopHandle;
@@ -41,6 +45,7 @@ pub(super) struct RuntimeState {
     idle_hint_state: Option<bool>,
     idle_hint_updates: Vec<bool>,
     preparing_for_sleep: bool,
+    native_sleep: SleepCycle,
     pub(super) commands: CommandRuntime,
     runtime_events: Vec<RuntimeEvent>,
     shutdown: Option<ShutdownSignal>,
@@ -77,6 +82,7 @@ impl RuntimeState {
             idle_hint_state: config.idle_hint_timeout_seconds.map(|_| false),
             idle_hint_updates: Vec::new(),
             preparing_for_sleep: false,
+            native_sleep: SleepCycle::default(),
             commands: CommandRuntime::default(),
             runtime_events: Vec::new(),
             shutdown: None,
@@ -87,6 +93,7 @@ impl RuntimeState {
         // inhibitors apply before same-wakeup idle events, and status sees both
         self.route_dbus_inhibit_events()?;
         self.route_reload_events()?;
+        self.route_native_sleep_events();
         self.route_session_events()?;
         self.route_wayland_events()?;
         self.route_control_events()
@@ -132,6 +139,7 @@ impl RuntimeState {
         &mut self,
         handle: &LoopHandle<'static, RuntimeState>,
     ) -> Result<(), RuntimeError> {
+        let before = self.runtime_events.len();
         for intent in std::mem::take(&mut self.session_command_intents) {
             self.commands.dispatch_session(
                 handle,
@@ -142,6 +150,8 @@ impl RuntimeState {
             )?;
         }
 
+        self.observe_native_sleep_commands(before);
+
         for intent in std::mem::take(&mut self.command_intents) {
             self.commands
                 .dispatch_listener(handle, intent, &mut self.runtime_events)?;
@@ -151,8 +161,11 @@ impl RuntimeState {
     }
 
     pub(super) fn collect_ready_processes(&mut self) -> Result<(), RuntimeError> {
+        let before = self.runtime_events.len();
         self.commands
-            .collect_ready_processes(&mut self.runtime_events)
+            .collect_ready_processes(&mut self.runtime_events)?;
+        self.observe_native_sleep_commands(before);
+        Ok(())
     }
 
     pub(super) fn push_runtime_event(&mut self, event: RuntimeEvent) {
@@ -249,7 +262,14 @@ impl RuntimeState {
     }
 
     pub(super) fn record_control_event(&mut self, event: ControlEvent) {
-        self.control_events.push(event);
+        match event {
+            ControlEvent::Sleep {
+                event,
+                cycle,
+                request,
+            } => self.native_sleep.events.push((event, cycle, request)),
+            event => self.control_events.push(event),
+        }
     }
 
     pub(super) fn mark_control_channel_closed(&mut self) {
@@ -304,6 +324,11 @@ impl RuntimeState {
                         return Err(RuntimeError::ReloadRequestChannelClosed);
                     }
                 },
+                ControlEvent::Sleep { request, .. } => {
+                    if let Some(request) = request {
+                        request.respond("error: unexpected sleep event routing\n".into());
+                    }
+                }
                 ControlEvent::Failed(error) => return Err(RuntimeError::Control(error)),
             }
         }
@@ -364,33 +389,8 @@ impl RuntimeState {
     fn route_session_events(&mut self) -> Result<(), RuntimeError> {
         for event in std::mem::take(&mut self.session_events) {
             match event {
-                SessionEvent::PrepareForSleep(inhibitor) => {
-                    if self.preparing_for_sleep {
-                        continue;
-                    }
-                    self.preparing_for_sleep = true;
-                    self.runtime_events.push(RuntimeEvent::PreparingForSleep);
-                    self.queue_session_command(
-                        self.session_commands.before_sleep.clone(),
-                        CommandContext::BeforeSleep,
-                        inhibitor,
-                    );
-                }
-                SessionEvent::Resumed => {
-                    self.preparing_for_sleep = false;
-                    // this cycle is over even if its hook is still running or queued
-                    self.commands.release_sleep_inhibitors();
-                    for intent in &mut self.session_command_intents {
-                        intent.inhibitor = None;
-                    }
-                    self.set_idle_hint(false);
-                    self.runtime_events.push(RuntimeEvent::ResumedFromSleep);
-                    self.queue_session_command(
-                        self.session_commands.after_resume.clone(),
-                        CommandContext::AfterResume,
-                        None,
-                    );
-                }
+                SessionEvent::PrepareForSleep(inhibitor) => self.prepare_sleep(inhibitor),
+                SessionEvent::Resumed => self.resume_sleep(),
                 SessionEvent::LockRequested => {
                     self.runtime_events.push(RuntimeEvent::LockRequested);
                     self.queue_session_command(
@@ -430,6 +430,8 @@ impl RuntimeState {
     }
 
     pub(super) fn discard_pending_events(&mut self) {
+        self.native_sleep.reject("daemon is shutting down");
+        self.native_sleep.events.clear();
         self.wayland.take_events();
         self.session_events.clear();
         self.dbus_inhibit_events.clear();
@@ -530,6 +532,7 @@ impl RuntimeState {
 
         StatusSnapshot {
             paused: self.paused,
+            preparing_for_sleep: self.preparing_for_sleep,
             listeners: self.listeners.status(),
             dbus_inhibitors,
             systemd_inhibitors: self.inhibition.systemd_details().to_vec(),
@@ -602,6 +605,7 @@ struct SessionCommands {
     unlock: Option<String>,
     before_sleep: Option<String>,
     after_resume: Option<String>,
+    wait_before_sleep: bool,
 }
 
 impl From<&GeneralConfig> for SessionCommands {
@@ -611,6 +615,7 @@ impl From<&GeneralConfig> for SessionCommands {
             unlock: config.unlock_command.clone(),
             before_sleep: config.before_sleep_command.clone(),
             after_resume: config.after_resume_command.clone(),
+            wait_before_sleep: config.wait_before_sleep,
         }
     }
 }
