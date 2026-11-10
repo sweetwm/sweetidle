@@ -1,4 +1,4 @@
-.TH SWEETIDLE 1 "September 2026" "sweetidle 0.1.0" "User Commands"
+.TH SWEETIDLE 1 "November 9, 2026" "sweetidle 0.1.0" "User Commands"
 .SH NAME
 sweetidle \- Wayland idle management daemon for the Sweets compositor
 .SH SYNOPSIS
@@ -24,8 +24,10 @@ is a lightweight Wayland idle daemon for the Sweets compositor.
 It uses
 .B ext-idle-notify-v1
 to run commands when you go idle and when you return.
-It also runs hooks for sleep, resume, lock, and unlock, and respects idle
-inhibitors by default.
+It also runs sleep, resume, lock, and unlock hooks, and respects idle
+inhibitors.
+Lock and unlock hooks need Linux logind.
+Sleep hooks need logind on Linux or the rc hook on FreeBSD.
 .PP
 With no command, it runs in the foreground until stopped.
 .SH COMMANDS
@@ -34,65 +36,57 @@ With no command, it runs in the foreground until stopped.
 Show daemon, listener, idle-hint, and inhibitor state.
 .TP
 .B "status --json"
-Print the same state as one JSON object with
-.BR schema_version ,
-.BR paused ,
-.BR idle_hint ,
-.BR listeners ,
-and
-.BR inhibitors .
+Print the same state as one JSON object.
 .TP
 .B pause
 Stop idle timers and clear the idle hint.
-Running commands and sleep and lock hooks are not affected.
+Running commands and sleep and lock hooks still run.
 .TP
 .B resume
 Restart idle timers from zero.
 .TP
 .B reload
-Queue a config reload; check the logs for the result.
+Queue a config reload. Check the logs for the result.
 An invalid config keeps the old one active.
-Running commands keep running.
-Changing a listener that has already timed out rejects the reload; retry after
-activity resumes.
+Changing a listener that already timed out rejects the reload.
+Retry once you are active again.
 .SH OPTIONS
 .TP
 .BI "\-c " PATH ", \-\-config " PATH
-Read configuration from
-.I PATH
-instead of the default path.
+Use the config at
+.IR PATH .
 .TP
 .B \-\-check-config
-Validate the configuration and exit.
+Validate the config and exit.
+Also rejects features this platform does not support.
 .TP
 .BR \-v ", " \-\-verbose
-Enable debug-level runtime logging.
+Debug logging.
 .TP
 .B \-\-json
-Print machine-readable output for the
-.B status
-command.
+JSON output for
+.BR status .
 .TP
 .BR \-h ", " \-\-help
-Print command-line help and exit.
+Print help and exit.
 .TP
 .BR \-V ", " \-\-version
 Print the version and exit.
 .SH CONFIGURATION
-The default configuration path is
-.IR ~/.config/sweetidle/config.toml .
-The file is UTF-8 TOML, at most 1 MiB, and unknown fields are rejected.
+The config is
+.IR ~/.config/sweetidle/config.toml :
+UTF-8 TOML, at most 1 MiB.
+Unknown fields are errors.
 Timeouts are seconds from 1 to 4294967.
 Commands must not be empty and run through
 .BR "sh -c" .
-Their standard input and output are
+stdin and stdout are
 .IR /dev/null ;
-their standard error is inherited from
-.BR sweetidle .
+stderr is inherited from sweetidle.
 .PP
-The optional
+Optional
 .B [general]
-table accepts the following fields:
+fields:
 .TP
 .B lock_command
 Run on a logind lock request.
@@ -108,9 +102,9 @@ Run before suspend.
 Run after resume.
 .TP
 .B wait_before_sleep
-Delay suspend until the before-sleep command exits, up to logind's maximum
-delay.
-Use a locker that daemonizes only after locking.
+Hold suspend until the before-sleep command exits: up to logind's max delay
+on Linux, 4 seconds on FreeBSD.
+Use a locker that returns only once locked.
 Defaults to true.
 .TP
 .B ignore_dbus_inhibit
@@ -122,26 +116,29 @@ Defaults to false.
 .B ignore_systemd_inhibit
 Ignore systemd-logind idle inhibitors.
 Defaults to false.
+No effect on FreeBSD.
 .PP
-The optional
+Optional
 .B [idle_hint]
-table has one required
-.B timeout
-field.
-After that many idle seconds, the session is reported idle to logind.
+has one required
+.BR timeout .
+After that many idle seconds, logind is told the session is idle.
+Linux only.
 .PP
 Each
 .B [[listener]]
-table accepts:
+accepts:
 .TP
 .B timeout
-Required idle time in seconds.
+Idle seconds. Required.
 .TP
 .B on_timeout
 Run when the timeout expires.
 .TP
 .B on_resume
-Run when activity returns after this timeout.
+Run when activity returns, only if
+.B on_timeout
+ran.
 .TP
 .B ignore_inhibit
 Run despite all idle inhibitors.
@@ -150,6 +147,11 @@ Requires
 version 2.
 Defaults to false.
 .SH EXAMPLE CONFIGURATION
+A Linux example.
+On FreeBSD, drop
+.B lock_command
+and
+.BR [idle_hint] .
 .EX
 [general]
 lock_command = "veila lock --wait-ready"
@@ -177,16 +179,20 @@ The ScreenSaver service answers at
 .I /org/freedesktop/ScreenSaver
 and
 .IR /ScreenSaver .
-If another service already owns that name, as niri does, sweetidle leaves
-D-Bus inhibitors to it.
+If another service owns that name, as niri does, sweetidle leaves D-Bus
+inhibitors to it.
+.PP
 .B status
-lists D-Bus and systemd inhibitors; compositor inhibitors are not visible to
-clients.
+lists D-Bus and systemd inhibitors.
+Compositor inhibitors are not visible to clients.
+systemd monitoring shows as enabled, ignored, or unsupported
+.RB ( inhibitors.systemd_status
+in JSON).
 .SH CONTROL SOCKET
-Control commands talk to
+Commands use
 .I $XDG_RUNTIME_DIR/sweetidle.sock
 (mode 0600).
-A live socket prevents a second daemon from starting.
+While it is live, a second daemon will not start.
 .SH SIGNALS
 .TP
 .B SIGINT, SIGTERM
@@ -199,22 +205,21 @@ Same as
 .SH ENVIRONMENT
 .TP
 .B HOME
-Used for the default config path.
+Base of the default config path.
 Must be absolute unless
 .B \-\-config
-is given.
+is set.
 .TP
 .B XDG_RUNTIME_DIR
-Holds the control socket.
-Required.
+Holds the control socket. Required.
 .TP
 .B WAYLAND_DISPLAY
 Wayland display to connect to.
 .TP
 .B XDG_SESSION_ID
 Logind session to use.
-If unset, logind picks the caller's session or, for a systemd user service,
-the user's graphical display session.
+If unset, logind picks the caller's session, or the graphical session for a
+systemd user service.
 .SH FILES
 .TP
 .I ~/.config/sweetidle/config.toml
@@ -229,33 +234,105 @@ Systemd user service.
 .I /usr/share/man/man1/sweetidle.1
 This manual page.
 .SH SYSTEMD USER SERVICE
-The supplied
 .B sweetidle.service
-unit runs with
-.BR graphical-session.target .
-Enable it with:
+runs with
+.BR graphical-session.target :
 .PP
 .EX
 systemctl --user enable --now sweetidle.service
 .EE
 .PP
 Don't also start sweetidle from your compositor config.
+.SH FREEBSD
+Tested on FreeBSD 15.1 amd64 with Sweets.
+Build with Cargo and start sweetidle from the compositor's startup config.
+It needs the session's
+.BR WAYLAND_DISPLAY ,
+.BR XDG_RUNTIME_DIR ,
+and
+.BR DBUS_SESSION_BUS_ADDRESS .
+Without a session bus, set
+.BR ignore_dbus_inhibit .
+The example config is
+.IR config/freebsd.toml .
+.PP
+Logs go to stderr.
+Redirect them or use the compositor's session log.
+.PP
+Sleep hooks need the rc hook:
+.PP
+.EX
+sudo install -m 755 target/release/sweetidle /usr/local/bin/sweetidle
+sudo install -m 755 freebsd/sweetidle_sleep /usr/local/etc/rc.d/sweetidle_sleep
+sudo sysrc sweetidle_sleep_enable=YES
+sudo sysrc sweetidle_sleep_runtime_dirs="$XDG_RUNTIME_DIR"
+.EE
+.PP
+Then set
+.B before_sleep_command
+and
+.B after_resume_command
+and restart sweetidle.
+Commands run as your user; the root hook only sends notifications.
+.sp
+.PD 0
+.IP \(bu 2
+With
+.BR wait_before_sleep ,
+the command must succeed within 4 seconds or suspend is cancelled.
+Without it, the hook does not wait for locking.
+.IP \(bu 2
+After-resume runs once, on resume or on cancel.
+.IP \(bu 2
+A new suspend fails while an older before-sleep command still runs.
+.IP \(bu 2
+FreeBSD's 10-second forced-suspend fallback still applies.
+The hook is not a system-wide inhibitor.
+.IP \(bu 2
+For multiple sessions, list up to 16 absolute runtime dirs, space separated,
+without whitespace in the paths.
+.IP \(bu 2
+Set
+.B sweetidle_sleep_command
+in rc.conf if the binary is elsewhere.
+.IP \(bu 2
+Set
+.B sweetidle_sleep_enable=NO
+to turn the hook off.
+.IP \(bu 2
+Adding the first sleep hook or removing the last needs a restart.
+.PD
+.PP
+The hook uses the rc-only commands
+.BR "before-sleep ID" ,
+.BR "after-resume ID" ,
+and
+.B "cancel-sleep ID"
+on a separate
+.I sweetidle-sleep.sock
+(mode 0600).
+.PP
+.BR lock_command ,
+.BR unlock_command ,
+and
+.B [idle_hint]
+need logind and are rejected.
+systemd inhibitors are unsupported.
+ConsoleKit is not supported.
+Use a listener to lock on idle.
 .SH EXIT STATUS
 .B sweetidle
-returns 0 on success and 2 on any error.
-This includes the compositor closing the Wayland connection, which
-.B sweetidle
-reports as
-.IR "compositor closed the Wayland connection" ,
-so a service manager can restart it after a compositor crash.
+returns 0 on success and 2 on any error, including
+.IR "compositor closed the Wayland connection" .
+A service manager can then restart it after a compositor crash.
 .SH EXAMPLES
-Validate an explicit configuration:
+Check a config file:
 .PP
 .EX
 sweetidle --config ./config.toml --check-config
 .EE
 .PP
-Run with verbose diagnostics:
+Run with debug logs:
 .PP
 .EX
 sweetidle --verbose --config ./config.toml
@@ -267,7 +344,7 @@ Read the paused state:
 sweetidle status --json | jq -r .paused
 .EE
 .PP
-Reload the active configuration:
+Reload the config:
 .PP
 .EX
 pkill -HUP -x sweetidle
@@ -278,9 +355,11 @@ pkill -HUP -x sweetidle
 .BR systemd.service (5),
 .BR loginctl (1)
 .PP
-Project source and documentation:
+Source and docs:
 .br
 https://github.com/naurissteins/sweetidle
+.br
+https://sweetwm.org/docs/sweetidle
 .SH AUTHORS
 Nauris Steins
 .SH LICENSE
