@@ -14,8 +14,8 @@ Lightweight and powerful idle daemon for Wayland compositors
 ## 🔥 Features
 - Multiple idle listeners, each with its own timeout and resume command
 - Lock before suspend and run hooks after resume
-- Handle logind lock and unlock requests
-- Respect compositor, D-Bus, and systemd idle inhibitors
+- Handle logind lock and unlock requests on Linux
+- Respect compositor and D-Bus idle inhibitors, plus systemd inhibitors on Linux
 - Hot reload with no restart (a bad config keeps the old one running)
 - Control commands: `status`, `pause`, `resume`, and `reload`
 - Simple TOML config that is checked before it is used
@@ -90,6 +90,12 @@ services.sweetidle = {
 
 Leave `settings` empty to use `~/.config/sweetidle/config.toml` instead.
 
+### FreeBSD
+
+Tested on FreeBSD 15.1 amd64 with Sweets. Build from source and start it from
+your compositor. See the [FreeBSD guide](https://sweetwm.org/docs/sweetidle/freebsd)
+for setup, sleep hooks, and limits.
+
 ## Config
 
 Config lives in `~/.config/sweetidle/config.toml`. Check it with:
@@ -118,6 +124,8 @@ on_resume = "sweets msg output-power '*' on"
 
 ### Lock before suspend
 
+Requires Linux with logind, or the [FreeBSD rc hook](https://sweetwm.org/docs/sweetidle/freebsd#sleep-hooks).
+
 ```toml
 [general]
 before_sleep_command = "veila lock --wait-ready"
@@ -126,6 +134,8 @@ wait_before_sleep = true
 ```
 
 ### Handle `loginctl lock-session`
+
+Requires Linux with logind.
 
 ```toml
 [general]
@@ -140,7 +150,7 @@ ignore_dbus_inhibit = true
 ignore_systemd_inhibit = true
 ```
 
-See the full [example config](config/example.toml).
+See the [Linux example](config/example.toml) or [FreeBSD example](config/freebsd.toml).
 
 ## Usage
 
@@ -151,7 +161,11 @@ sweetidle resume    # start timers again
 sweetidle reload    # reload config
 ```
 
-Logs:
+`status` shows whether systemd inhibitor monitoring is `enabled`, `ignored`, or
+`unsupported`. `status --json` includes this as `inhibitors.systemd_status`;
+the existing version 1 fields keep their meanings.
+
+Logs for the Linux systemd user service:
 
 ```bash
 journalctl --user -u sweetidle.service -f
